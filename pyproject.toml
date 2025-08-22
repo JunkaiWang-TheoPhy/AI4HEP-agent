@@ -1,0 +1,19 @@
+[project]
+name = "kin-mcp"
+version = "0.1.0"
+description = "MCP server for scholarly kinship via INSPIRE + arXiv + GROBID"
+requires-python = ">=3.10"
+dependencies = [
+  "mcp[cli]>=2.0.0",
+  "httpx>=0.27.0",
+  "pydantic>=2.6.0",
+  "lxml>=5.2.0",
+  "networkx>=3.2.0",
+  "python-dateutil>=2.9.0"
+]
+
+[project.scripts]
+kin-mcp = "kin_mcp.server:main"
+
+[tool.uv]  # 如果你用 uv（推荐）
+dev-dependencies = []
