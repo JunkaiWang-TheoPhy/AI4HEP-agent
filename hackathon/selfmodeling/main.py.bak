@@ -1,0 +1,844 @@
+# mcp_self_host_hardened.py
+# Hardened + self-healing + self-evolving single-file MCP server.
+# Guarantees:
+# - Server id = "selfmodeling" (matches your router prefix).
+# - Built-in tool 'solve_thermo_ode_with_mathematica' is ALWAYS present.
+# - 'invoke_registered_tool(name, args)' lets you call ANY registered tool,
+#   including dynamically added ones, even if the client didn't refresh its tool list.
+# - Dynamic region is locked & auto-healed; orphan blocks are migrated.
+#
+# SECURITY: Executed code has full Python privileges. Use only in trusted environments.
+
+from __future__ import annotations
+
+import sys
+import re
+import os
+import uuid
+import logging
+import inspect
+import subprocess
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any, Callable
+
+from mcp.server.fastmcp import FastMCP
+
+# ---------------- Logging (stderr only; NEVER stdout) ----------------
+logging.basicConfig(stream=sys.stderr, level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("mcp-selfmodeling")
+
+# ---------------- MCP instance (IMPORTANT: id matches your router) ----------------
+mcp = FastMCP(
+    "selfmodeling",
+    instructions=("Self-modifying MCP server (hardened). "
+                  "Use 'safe_add_tool_block' to add tools, 'repair_self_file' to self-heal, "
+                  "'reload_all_blocks' to activate persisted blocks. "
+                  "Call ANY tool via 'invoke_registered_tool' if client didn't refresh its tool list.")
+)
+
+# ---------------- Tool registry / metadata ----------------
+_REGISTERED_TOOL_NAMES: List[str] = []
+_TOOL_META: Dict[str, Dict[str, Any]] = {}    # name -> {doc, signature, origin, blocks: [ids]}
+_TOOL_FUNCS: Dict[str, Callable[..., Any]] = {}  # name -> function object
+_LOADED_BLOCK_IDS: set[str] = set()
+
+# ------------- notify tools-changed (best-effort; client may still need reconnect) -------------
+def _notify_tools_changed_safe() -> bool:
+    notified = False
+    for attr in ("notify_tools_changed", "announce_tools_changed", "tools_changed", "announce_tools"):
+        fn = getattr(mcp, attr, None)
+        if callable(fn):
+            try:
+                fn(); notified = True
+                log.info("tools-changed notification sent via mcp.%s()", attr)
+                break
+            except Exception as e:
+                log.warning("tools-changed via mcp.%s() failed: %r", attr, e)
+    if not notified:
+        srv = getattr(mcp, "_server", None) or getattr(mcp, "server", None)
+        if srv is not None:
+            for attr in ("notify_tools_changed", "announce_tools_changed", "tools_changed"):
+                fn = getattr(srv, attr, None)
+                if callable(fn):
+                    try:
+                        fn(); notified = True
+                        log.info("tools-changed notification sent via server.%s()", attr)
+                        break
+                    except Exception as e:
+                        log.warning("tools-changed via server.%s() failed: %r", attr, e)
+    if not notified:
+        log.info("No tools-changed notifier available; client may need to re-list tools or reconnect.")
+    return notified
+
+# ---------------- Patch @mcp.tool decorator to record metadata ----------------
+_orig_tool_decorator_factory = mcp.tool
+def _recording_tool_decorator_factory(*dargs, **dkwargs):
+    inner = _orig_tool_decorator_factory(*dargs, **dkwargs)
+    def _decorator(func):
+        name = getattr(func, "__name__", "<anonymous>")
+        try:
+            sig = str(inspect.signature(func))
+        except Exception:
+            sig = "(...)"
+        doc = (func.__doc__ or "").strip()
+
+        if name not in _REGISTERED_TOOL_NAMES:
+            _REGISTERED_TOOL_NAMES.append(name)
+        _TOOL_FUNCS[name] = func  # keep direct handle for invoke_registered_tool
+
+        meta = _TOOL_META.get(name, {})
+        meta.update({
+            "doc": doc,
+            "signature": sig,
+            "origin": meta.get("origin", "builtin"),
+            "blocks": meta.get("blocks", []),
+        })
+
+        try:
+            # Link tool -> active block (if any) for provenance.
+            bid = getattr(func, "__globals__", {}).get("__MCP_ACTIVE_BLOCK_ID", None)
+            if isinstance(bid, str) and bid:
+                blist = meta.get("blocks", [])
+                if bid not in blist:
+                    blist.append(bid)
+                meta["blocks"] = blist
+                _LOADED_BLOCK_IDS.add(bid)
+        except Exception as e:
+            log.debug("block-linking failed for %s: %r", name, e)
+
+        _TOOL_META[name] = meta
+        log.info("Tool registered: %s %s", name, sig)
+        return inner(func)
+    return _decorator
+
+mcp.tool = _recording_tool_decorator_factory  # type: ignore[attr-defined]
+
+# ---------------- Canonical markers ----------------
+SELF_PATH = Path(__file__).resolve()
+_LIT_START = "# === DYNAMIC TOOLS START ==="
+_LIT_END   = "# === DYNAMIC TOOLS END ==="
+
+START_MARK = _LIT_START
+END_MARK   = _LIT_END
+
+ENTRY_MARK = "# ---------------- Entry ----------------"
+MAIN_GUARD = "if __name__"
+
+BLOCK_START = "# --- BLOCK"
+BLOCK_END   = "# --- END ---"
+
+_BLOCK_RE = re.compile(
+    r"(?P<all>#\s*---\s*BLOCK\s+(?P<id>[A-Za-z0-9_\-]+)\s+START\s*---\s*\n)"
+    r"(?P<body>.*?)(#\s*---\s*END\s*---\s*\n)",
+    re.DOTALL
+)
+
+# ---------------- File helpers ----------------
+def _read_self_text() -> str:
+    return SELF_PATH.read_text(encoding="utf-8")
+
+def _write_self_text(new_text: str) -> None:
+    bak = SELF_PATH.with_suffix(SELF_PATH.suffix + ".bak")
+    try:
+        bak.write_text(_read_self_text(), encoding="utf-8")
+    except Exception:
+        pass
+    SELF_PATH.write_text(new_text, encoding="utf-8")
+
+# ---------------- Dynamic region helpers ----------------
+def _normalize_marker_lines(text: str) -> Tuple[str, bool]:
+    changed = False
+    pat_start = re.compile(r'^.*#\s*===\s*DYNAMIC TOOLS START\s*===.*$', re.MULTILINE)
+    pat_end   = re.compile(r'^.*#\s*===\s*DYNAMIC TOOLS END\s*===.*$',   re.MULTILINE)
+    new_text, c1 = pat_start.subn(_LIT_START, text)
+    new_text, c2 = pat_end.subn(_LIT_END, new_text)
+    if c1 or c2: changed = True
+    return new_text, changed
+
+def _ensure_dynamic_region_exists(text: str) -> Tuple[str, bool]:
+    text, normed = _normalize_marker_lines(text)
+    insert_idx = text.find(ENTRY_MARK)
+    if insert_idx == -1:
+        insert_idx = text.find(MAIN_GUARD)
+    if insert_idx == -1:
+        insert_idx = len(text)
+
+    has_start = (_LIT_START in text)
+    has_end   = (_LIT_END in text)
+    if has_start and has_end:
+        start = text.find(_LIT_START); end = text.find(_LIT_END)
+        if start == -1 or end == -1 or end < start:
+            block = f"{_LIT_START}\n# (dynamic @mcp.tool() blocks will be inserted here)\n{_LIT_END}\n\n"
+            return text[:insert_idx] + block + text[insert_idx:], True
+        if start < insert_idx:
+            return text, normed
+        # move region before ENTRY
+        end_line_end = text.find("\n", end)
+        if end_line_end == -1: end_line_end = len(text)
+        region_text = text[start:end_line_end+1]
+        text_wo = text[:start] + text[end_line_end+1:]
+        new_text = text_wo[:insert_idx] + region_text + text_wo[insert_idx:]
+        return new_text, True
+
+    # create region
+    block = f"{_LIT_START}\n# (dynamic @mcp.tool() blocks will be inserted here)\n{_LIT_END}\n\n"
+    return text[:insert_idx] + block + text[insert_idx:], True
+
+def _find_dynamic_region(text: str) -> Tuple[int, int, int, int]:
+    start = text.find(_LIT_START); end = text.find(_LIT_END)
+    if start == -1 or end == -1 or end < start:
+        raise RuntimeError("Dynamic region markers not found or malformed.")
+    start_line_end = text.find("\n", start)
+    if start_line_end == -1: start_line_end = len(text)
+    body_start = start_line_end + 1
+    body_end   = end
+    return start, end, body_start, body_end
+
+def _parse_blocks(region_text: str) -> Dict[str, str]:
+    blocks: Dict[str, str] = {}
+    for m in _BLOCK_RE.finditer(region_text):
+        bid  = m.group("id")
+        body = m.group("body").lstrip("\n").rstrip() + "\n"
+        blocks[bid] = body
+    return blocks
+
+def _render_block(block_id: str, code: str) -> str:
+    return f"{BLOCK_START} {block_id} START ---\n" + f'__MCP_ACTIVE_BLOCK_ID = "{block_id}"\n' + \
+           code.strip() + "\n__MCP_ACTIVE_BLOCK_ID = None\n" + f"{BLOCK_END}\n"
+
+def _insert_or_replace_block(text: str, block_id: str, code: str, overwrite: bool) -> Tuple[str, bool, bool]:
+    text, _ = _ensure_dynamic_region_exists(text)
+    _, _, body_start, body_end = _find_dynamic_region(text)
+    region = text[body_start:body_end]
+    blocks = _parse_blocks(region)
+
+    created = False; replaced = False
+    rendered = _render_block(block_id, code)
+
+    if block_id in blocks:
+        if not overwrite:
+            return text, False, False
+        pattern = re.compile(
+            rf"(#\s*---\s*BLOCK\s+{re.escape(block_id)}\s+START\s*---\s*\n).*?(#\s*---\s*END\s*---\s*\n)",
+            re.DOTALL
+        )
+        new_region = pattern.sub(rendered, region, count=1)
+        replaced = True
+    else:
+        if region and not region.endswith("\n"): region += "\n"
+        new_region = region + rendered
+        created = True
+
+    new_text = text[:body_start] + new_region + text[body_end:]
+    return new_text, created, replaced
+
+# ---------------- Exec helpers ----------------
+def _current_tool_names() -> List[str]:
+    return list(_REGISTERED_TOOL_NAMES)
+
+def _diff_tools(before: List[str], after: List[str]) -> List[str]:
+    b, a = set(before), set(after)
+    return [name for name in after if name not in b]
+
+def _exec_dynamic_code(code: str, block_id: str) -> List[str]:
+    compiled = compile(code, f"<dyn:{block_id}>", "exec")
+    before = _current_tool_names()
+    g = {"mcp": mcp, "__name__": f"dyn_{block_id}", "__MCP_ACTIVE_BLOCK_ID": block_id}
+    l: Dict[str, Any] = {}
+    exec(compiled, g, l)
+    after = _current_tool_names()
+    added = _diff_tools(before, after)
+    for name in added:
+        meta = _TOOL_META.get(name, {})
+        meta.setdefault("blocks", []).append(block_id)
+        meta.setdefault("origin", "dynamic")
+        _TOOL_META[name] = meta
+    _LOADED_BLOCK_IDS.add(block_id)
+    return added
+
+# ---------------- Self-heal ----------------
+def _scan_all_blocks(text: str) -> List[Tuple[int, int, str, str]]:
+    out = []
+    for m in _BLOCK_RE.finditer(text):
+        out.append((m.start(), m.end(), m.group("id"),
+                    m.group("body").lstrip("\n").rstrip() + "\n"))
+    return out
+
+def _remove_span(text: str, start: int, end: int) -> str:
+    return text[:start] + text[end:]
+
+@mcp.tool()
+def repair_self_file(
+    dry_run: bool = False,
+    migrate_orphans: bool = True,
+    prefer: str = "region"
+) -> dict:
+    text = _read_self_text()
+    original = text
+
+    text, changed1 = _ensure_dynamic_region_exists(text)
+    _, _, body_start, body_end = _find_dynamic_region(text)
+    text, normed = _normalize_marker_lines(text)
+    changed2 = changed1 or normed
+    _, _, body_start, body_end = _find_dynamic_region(text)
+
+    moved, ignored = [], []
+    if migrate_orphans:
+        all_blocks = _scan_all_blocks(text)
+        region_blocks = _parse_blocks(text[body_start:body_end])
+        for start, end, bid, body in reversed(all_blocks):
+            inside = (start >= body_start and end <= body_end)
+            if inside: continue
+            if bid in region_blocks:
+                if prefer == "orphan":
+                    text = _remove_span(text, start, end)
+                    _, _, body_start, body_end = _find_dynamic_region(text)
+                    pattern = re.compile(
+                        rf"(#\s*---\s*BLOCK\s+{re.escape(bid)}\s+START\s*---\s*\n).*?(#\s*---\s*END\s*---\s*\n)",
+                        re.DOTALL
+                    )
+                    region_text = text[body_start:body_end]
+                    region_text = pattern.sub(_render_block(bid, body), region_text, count=1)
+                    text = text[:body_start] + region_text + text[body_end:]
+                    changed2 = True; moved.append(bid)
+                else:
+                    text = _remove_span(text, start, end)
+                    changed2 = True; ignored.append(bid)
+            else:
+                text = _remove_span(text, start, end)
+                _, _, body_start, body_end = _find_dynamic_region(text)
+                region_text = text[body_start:body_end]
+                if region_text and not region_text.endswith("\n"): region_text += "\n"
+                region_text += _render_block(bid, body)
+                text = text[:body_start] + region_text + text[body_end:]
+                changed2 = True; moved.append(bid)
+
+    text = re.sub(r'(# === DYNAMIC TOOLS (?:START|END) ===)"\s*$', r'\1', text, flags=re.MULTILINE)
+
+    summary = {"changed": changed2 or (text != original),
+               "moved_orphans": sorted(set(moved)),
+               "ignored_duplicates": sorted(set(ignored))}
+    if not dry_run and summary["changed"]:
+        _write_self_text(text); summary["written"] = True
+    else:
+        summary["written"] = False
+    return summary
+
+# ---------------- Block management ----------------
+@mcp.tool()
+def add_tool_block(
+    code: str,
+    block_id: Optional[str] = None,
+    overwrite: bool = False,
+    activate: bool = True,
+) -> dict:
+    code = code.strip()
+    if not code: return {"error": "Empty code."}
+    if block_id is None or not re.match(r"^[A-Za-z0-9_\-]+$", block_id or ""):
+        block_id = uuid.uuid4().hex[:8]
+    try:
+        compile(code, f"<dyn:{block_id}>", "exec")
+    except Exception as e:
+        return {"block_id": block_id, "persisted": False, "activated": False,
+                "error": f"Compile error: {e!r}"}
+    new_tools: List[str] = []
+    if activate:
+        try:
+            new_tools = _exec_dynamic_code(code, block_id)
+        except Exception as e:
+            return {"block_id": block_id, "persisted": False, "activated": False,
+                    "error": f"Runtime error during activation: {e!r}"}
+    try:
+        text = _read_self_text()
+        new_text, created, replaced = _insert_or_replace_block(text, block_id, code, overwrite=overwrite)
+        persisted = False
+        if created or replaced:
+            _write_self_text(new_text); persisted = True
+        if activate and new_tools:
+            _notify_tools_changed_safe()
+        elif (created or replaced):
+            _notify_tools_changed_safe()
+        return {"block_id": block_id, "persisted": persisted,
+                "created": created, "replaced": replaced,
+                "activated": bool(activate), "new_tools": new_tools,
+                "notes": "OK" if (persisted or activate) else "Block existed; skipped"}
+    except Exception as e:
+        return {"block_id": block_id, "persisted": False, "activated": bool(activate),
+                "new_tools": new_tools, "error": f"Persist error: {e!r}"}
+
+@mcp.tool()
+def list_tool_blocks() -> dict:
+    text, _ = _ensure_dynamic_region_exists(_read_self_text())
+    _, _, body_start, body_end = _find_dynamic_region(text)
+    region = text[body_start:body_end]
+    blocks = _parse_blocks(region)
+    return {
+        "blocks": sorted(blocks.keys()),
+        "by_block_tools": {bid: [name for name, meta in _TOOL_META.items() if bid in meta.get("blocks", [])]
+                           for bid in blocks.keys()},
+        "loaded": sorted(list(_LOADED_BLOCK_IDS)),
+    }
+
+@mcp.tool()
+def show_tool_block(block_id: str) -> str:
+    text, _ = _ensure_dynamic_region_exists(_read_self_text())
+    _, _, body_start, body_end = _find_dynamic_region(text)
+    region = text[body_start:body_end]
+    blocks = _parse_blocks(region)
+    if block_id not in blocks: return f"[not found] block_id={block_id}"
+    return blocks[block_id]
+
+@mcp.tool()
+def remove_tool_block(block_id: str) -> dict:
+    text, _ = _ensure_dynamic_region_exists(_read_self_text())
+    _, _, body_start, body_end = _find_dynamic_region(text)
+    region = text[body_start:body_end]
+    pattern = re.compile(
+        rf"(#\s*---\s*BLOCK\s+{re.escape(block_id)}\s+START\s*---\s*\n).*?(#\s*---\s*END\s*---\s*\n)",
+        re.DOTALL
+    )
+    if not pattern.search(region) and block_id not in _LOADED_BLOCK_IDS:
+        return {"ok": False, "error": f"Block not found: {block_id}"}
+    new_region = pattern.sub("", region, count=1)
+    new_text = text[:body_start] + new_region + text[body_end:]
+    _write_self_text(new_text)
+    _notify_tools_changed_safe()
+    return {"ok": True, "block_id": block_id,
+            "notes": "Removed from file. Restart to fully drop runtime registrations of this block."}
+
+@mcp.tool()
+def list_registered_tools() -> dict:
+    out = {}
+    for name in _current_tool_names():
+        meta = _TOOL_META.get(name, {})
+        out[name] = {
+            "signature": meta.get("signature", "(...)"),
+            "doc": meta.get("doc", ""),
+            "origin": meta.get("origin", "builtin"),
+            "blocks": meta.get("blocks", []),
+        }
+    return out
+
+@mcp.tool()
+def describe_tool(name: str) -> dict:
+    meta = _TOOL_META.get(name)
+    if not meta:
+        return {"ok": False, "error": f"Tool not found or metadata missing: {name}"}
+    return {"ok": True, "name": name, "signature": meta.get("signature", "(...)"),
+            "doc": meta.get("doc", ""), "origin": meta.get("origin", "unknown"),
+            "blocks": meta.get("blocks", [])}
+
+@mcp.tool()
+def usage_example_for_tool(name: str) -> dict:
+    meta = _TOOL_META.get(name)
+    if not meta:
+        return {"ok": False, "error": f"Unknown tool: {name}"}
+    sig = meta.get("signature", "(...)")
+    example = {}
+    try:
+        inside = sig.strip()
+        if inside.startswith("(") and inside.endswith(")"):
+            inside = inside[1:-1]
+        parts = [p.strip() for p in inside.split(",")] if inside else []
+        for p in parts:
+            if not p: continue
+            name_part = p.split(":", 1)[0].split("=", 1)[0].strip()
+            if name_part: example[name_part] = f"<{name_part}>"
+    except Exception:
+        pass
+    return {"ok": True, "tool": name, "signature": sig, "example_args": example, "doc": meta.get("doc", "")}
+
+@mcp.tool()
+def lint_block_code(code: str) -> dict:
+    import re as _re
+    issues: List[str] = []
+    if _re.search(r'^\s*from\s+mcp\.server\.fastmcp\s+import\s+FastMCP', code, _re.M):
+        issues.append("Imports FastMCP (不要在动态块创建新的 MCP 实例)")
+    if _re.search(r'^\s*import\s+mcp\.server\.fastmcp', code, _re.M):
+        issues.append("Imports mcp.server.fastmcp (高风险会新建 MCP)")
+    if _re.search(r'^\s*mcp\s*=', code, _re.M):
+        issues.append("Rebinds variable 'mcp' (会注册到错误实例)")
+    if _re.search(r'if\s+__name__\s*==\s*[\'"]__main__[\'"]\s*:', code):
+        issues.append("Has if __name__ == '__main__' guard (动态执行时不会触发)")
+    if "@mcp.tool" not in code:
+        issues.append("No '@mcp.tool()' decorator found")
+    return {"ok": True, "issues": issues}
+
+@mcp.tool()
+def diagnose_block(block_id: str) -> dict:
+    src = show_tool_block(block_id)
+    if src.startswith("[not found]"):
+        return {"ok": False, "error": f"block not found: {block_id}"}
+    res = lint_block_code(src)
+    return {"ok": True, "block_id": block_id, "issues": res.get("issues", []), "length": len(src)}
+
+@mcp.tool()
+def safe_add_tool_block(
+    code: str,
+    block_id: Optional[str] = None,
+    overwrite: bool = False,
+    activate: bool = True,
+    strict: bool = True
+) -> dict:
+    lint = lint_block_code(code)
+    issues = lint.get("issues", [])
+    fatal_markers = ("FastMCP", "Rebinds variable 'mcp'", "if __name__ == '__main__'", "No '@mcp.tool()'")
+    fatal = any(any(tok in m for tok in fatal_markers) for m in issues)
+    if strict and fatal:
+        return {"ok": False, "error": "lint_failed", "issues": issues}
+    res = add_tool_block(code=code, block_id=block_id, overwrite=overwrite, activate=activate)  # type: ignore
+    res.update({"lint_issues": issues, "ok": "error" not in res})
+    return res
+
+# ---------------- Mathematica/Wolfram helpers ----------------
+def _find_wolfram_cmd() -> Optional[str]:
+    for env in ("WOLFRAMSCRIPT", "WOLFRAM_CMD", "WOLFRAMKERNEL", "MATHEMATICA_CMD"):
+        v = os.environ.get(env)
+        if v and Path(v).exists(): return v
+    for cand in ("wolframscript", "math", "WolframKernel", "MathKernel", "WolframKernel.exe", "math.exe"):
+        p = shutil.which(cand)
+        if p: return p
+    return None
+
+def _exec_wolfram_code(code: str, timeout_s: float = 180.0) -> dict:
+    cmd = _find_wolfram_cmd()
+    if not cmd:
+        return {"ok": False, "error": "wolfram_not_found", "stdout": "", "stderr": ""}
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "run.wls"
+        f.write_text(code, encoding="utf-8")
+        exe = Path(cmd).name.lower()
+        if "wolframscript" in exe:
+            args = [cmd, "-file", str(f)]
+        elif exe.startswith("math"):
+            args = [cmd, "-noprompt", "-script", str(f)]
+        else:
+            args = [cmd, "-script", str(f)]
+        try:
+            r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               timeout=timeout_s, text=True)
+            return {"ok": r.returncode == 0, "stdout": r.stdout, "stderr": r.stderr,
+                    "returncode": r.returncode}
+        except subprocess.TimeoutExpired as e:
+            return {"ok": False, "error": "wolfram_timeout", "stdout": e.stdout or "", "stderr": e.stderr or ""}
+
+@mcp.tool()
+def exec_mathematica(code: str, timeout_s: float = 180.0) -> dict:
+    """Execute Wolfram/Mathematica code if available."""
+    return _exec_wolfram_code(code, timeout_s=timeout_s)
+
+# ---------------- ALWAYS PRESENT: solve_thermo_ode_with_mathematica ----------------
+@mcp.tool()
+def solve_thermo_ode_with_mathematica(
+    ode_system: List[str],
+    initial_conditions: List[str],
+    dependent_vars: List[str],
+    independent_var: str,
+    t_range: List[float],
+    params: Optional[Dict[str, float]] = None,
+    plot_title: str = "Thermodynamic System Evolution",
+    x_label: str = "Time",
+    y_label: str = "Value",
+    image_filename: str = "thermo_ode_plot.png",
+    timeout_s: float = 180.0,
+    also_csv: bool = True
+) -> dict:
+    """
+    Prefer Mathematica NDSolve + Plot; fallback to pure Python RK4 if Mathematica missing or fails.
+    """
+    out_dir = Path(os.environ.get("MCP_LATEX_OUTPUT_DIR", ".")).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img_path = out_dir / image_filename
+    csv_path = out_dir / (Path(image_filename).stem + "_data.csv")
+
+    # Wolfram path
+    const_rules = ", ".join([f"{k} -> {v}" for k, v in (params or {}).items()])
+    const_rules = const_rules if const_rules else ""
+    img_path_m = str(img_path).replace("\\", "/")
+    dep_vars_list = ", ".join(dependent_vars)
+    ode_list = ", ".join(ode_system + initial_conditions)
+    tmin, tmax = float(t_range[0]), float(t_range[1])
+
+    code = f"""
+params = {{{const_rules}}};
+depVars = {{{dep_vars_list}}};
+eqs = {{{ode_list}}} /. params;
+tmin = {tmin}; tmax = {tmax};
+t = {independent_var};
+sol = NDSolve[eqs, depVars, {{t, tmin, tmax}}];
+plt = Plot[
+  Evaluate[{{{", ".join([f"{v}[t]" for v in dependent_vars])}}} /. sol],
+  {{t, tmin, tmax}},
+  PlotLabel -> "{plot_title}",
+  AxesLabel -> {{"{x_label}", "{y_label}"}},
+  PlotLegends -> "Expressions",
+  ImageSize -> Medium
+];
+Export["{img_path_m}", plt];
+Print["MCP_OK"];
+"""
+    wolfram = _exec_wolfram_code(code, timeout_s=timeout_s)
+    used_fallback = False
+    if wolfram.get("ok"):
+        ok = True; plotted = True
+    else:
+        # Fallback to pure Python RK4
+        used_fallback = True
+        try:
+            import math, ast
+            SAFE_FUNCS = {
+                "sin": math.sin, "cos": math.cos, "tan": math.tan,
+                "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
+                "exp": math.exp, "log": math.log, "sqrt": math.sqrt,
+                "pow": pow, "abs": abs, "min": min, "max": max,
+            }
+            CONSTS = {"pi": math.pi, "e": math.e}
+            params = params or {}
+            def safe_eval(expr: str, state: dict, tval: float) -> float:
+                names = {}; names.update(CONSTS); names.update(params); names.update(state); names.update({"t": tval})
+                tree = ast.parse(expr, mode="eval")
+                def ev(node):
+                    import ast as _ast
+                    if isinstance(node, _ast.Expression): return ev(node.body)
+                    if isinstance(node, _ast.Constant):
+                        if isinstance(node.value, (int, float)): return float(node.value)
+                        raise ValueError("only numeric constants allowed")
+                    if isinstance(node, _ast.Name):
+                        if node.id in names: return float(names[node.id])
+                        raise ValueError(f"unknown name: {node.id}")
+                    if isinstance(node, _ast.BinOp) and isinstance(node.op, (_ast.Add,_ast.Sub,_ast.Mult,_ast.Div,_ast.Pow,_ast.Mod)):
+                        l = ev(node.left); r = ev(node.right)
+                        if isinstance(node.op, _ast.Add): return l+r
+                        if isinstance(node.op, _ast.Sub): return l-r
+                        if isinstance(node.op, _ast.Mult): return l*r
+                        if isinstance(node.op, _ast.Div): return l/r
+                        if isinstance(node.op, _ast.Pow): return l**r
+                        if isinstance(node.op, _ast.Mod): return l%r
+                    if isinstance(node, _ast.UnaryOp) and isinstance(node.op, (_ast.UAdd, _ast.USub)):
+                        v = ev(node.operand); return v if isinstance(node.op,_ast.UAdd) else -v
+                    if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Name):
+                        fname = node.func.id
+                        if fname not in SAFE_FUNCS: raise ValueError(f"function not allowed: {fname}")
+                        if node.keywords: raise ValueError("keyword arguments not allowed")
+                        args = [ev(a) for a in node.args]
+                        return float(SAFE_FUNCS[fname](*args))
+                    raise ValueError("disallowed expression")
+                return float(ev(tree))
+
+            # Parse RHS from strings like "T'[t] == -k*(T[t]-Tenv)"
+            rhs_map: Dict[str, str] = {}
+            for v in dependent_vars:
+                expr = None
+                for eq in ode_system:
+                    pat = re.compile(rf"^\s*{re.escape(v)}'\s*\[\s*{re.escape(independent_var)}\s*\]\s*==\s*(.+)$")
+                    m = pat.match(eq.strip())
+                    if m: expr = m.group(1).strip(); break
+                if expr is None: raise ValueError(f"fallback: cannot parse RHS for {v}")
+                rhs_map[v] = expr
+
+            # Parse ICs like "T[0] == 100"
+            y0: Dict[str, float] = {}
+            for ic in initial_conditions:
+                m = re.match(rf"\s*([A-Za-z]\w*)\s*\[\s*([-+]?\d*\.?\d+)\s*\]\s*==\s*([-+]?\d*\.?\d+)", ic.strip())
+                if not m: raise ValueError(f"fallback: cannot parse IC: {ic}")
+                y0[m.group(1)] = float(m.group(3))
+
+            t0, t1 = float(t_range[0]), float(t_range[1])
+            dt = max((t1 - t0) / 200.0, 1e-3)
+            direction = 1.0 if t1 >= t0 else -1.0
+            h0 = abs(float(dt)) * direction
+            t = t0
+            state = {v: float(y0[v]) for v in dependent_vars}
+            times = [t]; traj = [dict(state)]; steps = 0
+            while True:
+                if (direction > 0 and t >= t1) or (direction < 0 and t <= t1): break
+                h = h0
+                rem = (t1 - t)
+                if (direction > 0 and t + h > t1) or (direction < 0 and t + h < t1): h = rem
+                k1 = {v: safe_eval(rhs_map[v], state, t) for v in dependent_vars}
+                s2 = {v: state[v] + 0.5*h*k1[v] for v in dependent_vars}
+                k2 = {v: safe_eval(rhs_map[v], s2, t + 0.5*h) for v in dependent_vars}
+                s3 = {v: state[v] + 0.5*h*k2[v] for v in dependent_vars}
+                k3 = {v: safe_eval(rhs_map[v], s3, t + 0.5*h) for v in dependent_vars}
+                s4 = {v: state[v] + h*k3[v] for v in dependent_vars}
+                k4 = {v: safe_eval(rhs_map[v], s4, t + h) for v in dependent_vars}
+                state = {v: state[v] + (h/6.0)*(k1[v] + 2*k2[v] + 2*k3[v] + k4[v]) for v in dependent_vars}
+                t = t + h; steps += 1
+                if steps % 2 == 0:
+                    times.append(t); traj.append(dict(state))
+
+            # Plot (best-effort)
+            plotted = False
+            try:
+                import matplotlib.pyplot as plt
+                fig = plt.figure()
+                for v in dependent_vars:
+                    plt.plot(times, [s[v] for s in traj], label=v)
+                plt.title(plot_title); plt.xlabel(x_label); plt.ylabel(y_label); plt.legend()
+                fig.savefig(str(img_path), dpi=200, bbox_inches="tight"); plt.close(fig)
+                plotted = True
+            except Exception:
+                plotted = False
+
+            if also_csv:
+                with open(csv_path, "w", encoding="utf-8") as fp:
+                    fp.write("t," + ",".join(dependent_vars) + "\n")
+                    for i, tt in enumerate(times):
+                        row = [str(tt)] + [str(traj[i][v]) for v in dependent_vars]
+                        fp.write(",".join(row) + "\n")
+
+            ok = True
+        except Exception as e:
+            ok = False; plotted = False
+            wolfram.setdefault("error", str(e))
+
+    return {
+        "ok": ok,
+        "used_mathematica": wolfram.get("ok", False),
+        "used_fallback": used_fallback,
+        "image_path": str(img_path) if (img_path.exists() or used_fallback) else str(img_path),
+        "csv_path": str(csv_path) if csv_path.exists() else None,
+        "wolfram": wolfram,
+        "notes": "Mathematica executed" if wolfram.get("ok") else ("Fallback RK4 used" if used_fallback else "Mathematica unavailable and fallback failed")
+    }
+
+# ---------------- Cache-buster helper: unique Newton cooling tool ----------------
+@mcp.tool()
+def create_newton_cooling_tool(suffix: Optional[str] = None,
+                               block_id: Optional[str] = None,
+                               activate: bool = True) -> dict:
+    suf = (suffix or uuid.uuid4().hex[:8]).lower()
+    fname = f"run_thermo_simulation_{suf}"
+    bid = block_id or f"newton_cooling_{suf}"
+    code = f'''
+import math, os
+from pathlib import Path
+
+@mcp.tool()
+def {fname}(
+    k: float,
+    T0: float,
+    Tenv: float,
+    t1: float = 60.0,
+    dt: float = 0.5,
+    image_filename: str = "newtons_cooling_plot.png",
+    return_csv: bool = True
+) -> dict:
+    if dt <= 0: raise ValueError("dt must be > 0")
+    if t1 <= 0: raise ValueError("t1 must be > 0")
+    times = [0.0]; temps = [float(T0)]
+    t = 0.0; T = float(T0)
+    nsteps = int(max(1, round(t1 / dt))); h = t1 / nsteps
+    def f(temp, _t): return -k * (temp - Tenv)
+    for _ in range(nsteps):
+        k1=f(T,t); k2=f(T+0.5*h*k1,t+0.5*h); k3=f(T+0.5*h*k2,t+0.5*h); k4=f(T+h*k3,t+h)
+        T=T+(h/6.0)*(k1+2*k2+2*k3+k4); t=t+h; times.append(t); temps.append(T)
+    out_dir = Path(os.environ.get("MCP_LATEX_OUTPUT_DIR", ".")).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img = out_dir / image_filename
+    plotted=False
+    try:
+        import matplotlib.pyplot as plt
+        fig=plt.figure(); plt.plot(times, temps, label="T(t)")
+        plt.title("Newton's Cooling"); plt.xlabel("Time"); plt.ylabel("Temperature"); plt.legend()
+        fig.savefig(str(img), dpi=200, bbox_inches="tight"); plt.close(fig); plotted=True
+    except Exception:
+        plotted=False
+    csv = out_dir / (Path(image_filename).stem + "_data.csv")
+    with open(csv, "w", encoding="utf-8") as fp:
+        fp.write("t,T\\n"); [fp.write(f"{{tt}},{{Tv}}\\n") for tt, Tv in zip(times, temps)]
+    return {{"ok": True, "tool_name": "{fname}", "plotted": plotted, "image_path": str(img) if plotted else None, "csv_path": str(csv), "n": len(times)}}
+'''
+    res = safe_add_tool_block(code=code, block_id=bid, overwrite=False, activate=activate)  # type: ignore
+    res.update({"generated_tool": fname, "block_id": bid})
+    return res
+
+# ---------------- Manifest-independent invoker (CRITICAL) ----------------
+import inspect as _inspect
+import asyncio as _asyncio
+
+@mcp.tool()
+async def invoke_registered_tool(name: str, args: dict) -> Any:
+    """
+    Invoke ANY already-registered tool by function name inside this server process.
+    Works even if the client/router didn't refresh its tool manifest.
+    - name: function name (e.g., 'run_thermo_simulation_abc123')
+    - args: dict of keyword args for that tool
+    """
+    func = _TOOL_FUNCS.get(name)
+    if not func:
+        return {"ok": False, "error": f"tool_not_registered_in_process: {name}"}
+    try:
+        if _inspect.iscoroutinefunction(func):
+            return await func(**args)  # type: ignore
+        else:
+            return func(**args)       # type: ignore
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+# ---------------- Persisted-block (re)loading ----------------
+def _load_all_blocks_impl(force: bool = False) -> List[str]:
+    text, _ = _ensure_dynamic_region_exists(_read_self_text())
+    _, _, body_start, body_end = _find_dynamic_region(text)
+    blocks = _parse_blocks(text[body_start:body_end])
+    loaded_now: List[str] = []
+    for bid, body in blocks.items():
+        if not force and bid in _LOADED_BLOCK_IDS:
+            continue
+        try:
+            _exec_dynamic_code(body, bid)
+            loaded_now.append(bid)
+        except Exception as e:
+            log.exception("Failed loading block %s: %r", bid, e)
+    return loaded_now
+
+@mcp.tool()
+def reload_all_blocks(force: bool = False) -> dict:
+    loaded = _load_all_blocks_impl(force=force)
+    if loaded:
+        _notify_tools_changed_safe()
+    return {"ok": True, "loaded_block_ids": loaded,
+            "already_loaded": sorted(list(_LOADED_BLOCK_IDS - set(loaded)))}
+
+# ---------------- Resources ----------------
+@mcp.resource("self://source")
+def show_self_source() -> str:
+    try:
+        return _read_self_text()
+    except Exception as e:
+        return f"[error reading self] {e!r}"
+
+# ---------------- Health ----------------
+@mcp.tool()
+def healthcheck() -> str:
+    return "ok"
+
+@mcp.tool()
+def announce_tools_changed() -> dict:
+    ok = _notify_tools_changed_safe()
+    return {"ok": ok}
+
+# === DYNAMIC TOOLS START ===
+# (dynamic @mcp.tool() blocks will be inserted here)
+# === DYNAMIC TOOLS END ===
+
+# ---------------- Entry ----------------
+if __name__ == "__main__":
+    try:
+        rep = repair_self_file(dry_run=False, migrate_orphans=True, prefer="region")  # type: ignore
+        log.info("self-heal summary: %s", rep)
+    except Exception:
+        log.exception("self-heal failed on startup")
+
+    try:
+        loaded = _load_all_blocks_impl(force=False)
+        if loaded:
+            _notify_tools_changed_safe()
+        log.info("loaded blocks at startup: %s", loaded)
+    except Exception:
+        log.exception("loading blocks failed on startup")
+
+    mcp.run("stdio")

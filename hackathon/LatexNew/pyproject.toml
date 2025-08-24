@@ -1,0 +1,14 @@
+[project]
+name = "latexnew"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp[cli]>=1.13.1",
+    "typing>=3.10.0.0",
+    "uuid>=1.30",
+]
+
+[project.script]
+main="main.py"
